@@ -25,10 +25,35 @@ BASE_DIR = os.path.dirname(__file__)
 CHROMA_DIR = os.path.join(BASE_DIR, 'chroma_store')
 CORPUS_DIR = os.path.join(BASE_DIR, 'corpus')
 EMBED_MODEL = os.environ.get('EMBED_MODEL', 'all-MiniLM-L6-v2')
-client = chromadb.PersistentClient(path=CHROMA_DIR)
+CHROMA_PERSIST = os.environ.get('CHROMA_PERSIST', 'true').lower() in ('1', 'true', 'yes')
 
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-collection = client.get_or_create_collection(name="news", embedding_function=sentence_transformer_ef)
+# Lazy, memory-friendly singletons
+_client = None
+_embedding_fn = None
+_collection = None
+
+def get_collection():
+    global _client, _embedding_fn, _collection
+    if _client is None:
+        if CHROMA_PERSIST:
+            _client = chromadb.PersistentClient(path=CHROMA_DIR)
+        else:
+            _client = chromadb.Client()
+    if _embedding_fn is None:
+        # Defer model load until first use
+        _embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
+    if _collection is None:
+        _collection = _client.get_or_create_collection(name="news", embedding_function=_embedding_fn)
+    return _collection
+
+def get_client():
+    global _client
+    if _client is None:
+        if CHROMA_PERSIST:
+            _client = chromadb.PersistentClient(path=CHROMA_DIR)
+        else:
+            _client = chromadb.Client()
+    return _client
 
 
 class IngestBody(BaseModel):
@@ -93,8 +118,12 @@ def ingest(body: IngestBody):
 
     # Rebuild Chroma collection strictly from files in corpus dir
     # Drop and recreate collection so it contains only these docs
-    client.delete_collection("news")
-    new_collection = client.get_or_create_collection(name="news", embedding_function=sentence_transformer_ef)
+    col = get_collection()
+    try:
+        col._client.delete_collection("news")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    col = get_collection()
 
     texts, ids, metadatas = [], [], []
     for idx, (path, title, link) in enumerate(saved_files):
@@ -108,7 +137,7 @@ def ingest(body: IngestBody):
             continue
 
     if texts:
-        new_collection.add(documents=texts, metadatas=metadatas, ids=ids)
+        col.add(documents=texts, metadatas=metadatas, ids=ids)
 
     return {"saved_files": len(saved_files), "indexed": len(texts), "dir": CORPUS_DIR}
 
@@ -178,11 +207,12 @@ def index_from_corpus():
     if not os.path.isdir(CORPUS_DIR):
         return {"indexed": 0, "dir": CORPUS_DIR, "error": "corpus directory not found"}
 
+    cli = get_client()
     try:
-        client.delete_collection("news")
+        cli.delete_collection("news")
     except Exception:
         pass
-    new_collection = client.get_or_create_collection(name="news", embedding_function=sentence_transformer_ef)
+    col = get_collection()
 
     texts, ids, metadatas = [], [], []
     files = sorted([f for f in os.listdir(CORPUS_DIR) if f.lower().endswith('.txt')])
@@ -209,7 +239,7 @@ def index_from_corpus():
             continue
 
     if texts:
-        new_collection.add(documents=texts, metadatas=metadatas, ids=ids)
+        col.add(documents=texts, metadatas=metadatas, ids=ids)
     return {"indexed": len(texts), "dir": CORPUS_DIR}
 
 
@@ -220,7 +250,8 @@ class RetrieveBody(BaseModel):
 
 @app.post('/retrieve')
 def retrieve(body: RetrieveBody):
-    qres = collection.query(query_texts=[body.query], n_results=body.top_k)
+    col = get_collection()
+    qres = col.query(query_texts=[body.query], n_results=body.top_k)
     contexts = []
     docs = qres.get('documents', [[]])[0]
     metas = qres.get('metadatas', [[]])[0]
