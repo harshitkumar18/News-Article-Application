@@ -6,4 +6,3 @@ beautifulsoup4==4.12.2
 feedparser==6.0.10
 requests==2.31.0
 python-dotenv==1.0.0
-tiktoken==0.5.2
